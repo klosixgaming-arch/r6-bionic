@@ -77,6 +77,28 @@
 #define R6_LED_OFF            0x24C0003
 
 /*
+ * R6 Peripherals (found via ROM analysis, 1.7.0)
+ */
+#define R6_UART_BASE          0xBF002000  /* 1391 references - primary debug UART */
+#define R6_GIC_BASE           0xBF000000  /* 402 references - GIC Distributor */
+#define R6_GIC_CPU_BASE       0xBF000100  /* GIC CPU Interface */
+
+/* Additional GIC instances (multi-core) */
+#define R6_GIC2_BASE          0xC0000000
+#define R6_GIC2_CPU_BASE      0xC0000100
+#define R6_GIC3_BASE          0xD0000000
+#define R6_GIC3_CPU_BASE      0xD0000100
+#define R6_GIC4_BASE          0xD2000000
+#define R6_GIC4_CPU_BASE      0xD2000100
+
+/* MMIO peripheral blocks (by reference count) */
+#define R6_MMIO_BLOCK0        0xBF000000  /* 18 registers - GIC */
+#define R6_MMIO_BLOCK1        0xBF002000  /* 54 registers - UART */
+#define R6_MMIO_BLOCK2        0xBF006000  /* 19 registers */
+#define R6_MMIO_BLOCK3        0xBF00B000  /* 52 registers */
+#define R6_MMIO_BLOCK4        0xBF00E000  /* 26 registers */
+
+/*
  * R6 Machine State
  */
 typedef struct R6MachineState {
