@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+install/
+*.o
+*.a
+*.so
+
+# QEMU source (cloned by build script)
+qemu/
+
+# ROM dumps (large, add via LFS or download separately)
+*.bin
+*.rom
+*.img
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
