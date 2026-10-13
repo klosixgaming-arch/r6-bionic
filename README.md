@@ -1,250 +1,126 @@
-# R6-Bionic: Canon EOS R6 QEMU Emulation Project
+# R6-Bionic: Canon EOS R6 (DIGIC X) QEMU Emulation
 
-**Goal:** Emulate the Canon EOS R6 (DIGIC X / ARM Cortex-A9) in QEMU to run Magic Lantern and DryOS firmware in software.
+**Goal:** Emulate the Canon EOS R6 in QEMU and boot real DryOS firmware 1.7.0 with
+**visible graphics** (the camera GUI), so Magic Lantern can be developed and tested in
+software.
 
-**Date:** 2026-10-11
-**Status:** Initial machine definition created, build system configured
+**Status:** the `canon-r6` QEMU machine is implemented and **compiling**. The firmware
+boots past power-init and runs real ROM code. The original boot panic (a deliberate
+DryOS spinlock-timeout halt) is diagnosed and the fix — a **custom GIC shim** (the
+DIGIC X GIC uses a non-standard register layout the stock QEMU GIC cannot serve) plus a
+**core-1 release on GIC SGI 12** — is implemented. Now in the build-and-test loop.
 
----
-
-## Research Findings
-
-### Current State of QEMU Canon Support
-
-| Component | Status |
-|-----------|--------|
-| DIGIC I-IV (ARM7/ARM9) | ✅ Basic support (`canon-a1100` machine) |
-| DIGIC V-VII (ARM926) | ⚠️ Partial (via `digic_boards.c`) |
-| DIGIC VIII (Cortex-A8) | ❌ Not supported |
-| DIGIC X (Cortex-A9) | ❌ **Not supported - THIS PROJECT** |
-| Running real firmware | ❌ Only barebox bootloader works |
-
-### What "coon" Did (EOS RP)
-
-- **coon42/openrp**: PCB reverse engineering of the Canon EOS RP (KiCad schematic)
-- LED GPIO address: `0xD22392B8` (RP) vs `0xD22390C0` (R6)
-- This was **hardware reverse engineering**, not QEMU emulation
-- The "running in QEMU" claim likely refers to running a Magic Lantern payload in QEMU with a stubbed hardware environment, not full DryOS
-
-### Key QEMU References
-
-- **qemu-eos**: `reticulatedpines/qemu-eos` (QEMU fork with DIGIC support)
-- **DIGIC docs**: `docs/system/arm/digic.rst` - "emulation is incomplete, cannot run original firmware"
-- **Board code**: `hw/arm/digic_boards.c` - only defines `canon-a1100`
-- **SoC model**: `include/hw/arm/digic.h` - ARM CPU + 3 timers + UART
+> **Read [`docs/QEMU_FINDINGS.md`](docs/QEMU_FINDINGS.md) first** — it is the live,
+> verified record of every address, the GIC protocol, core-1 bring-up, the boot flow,
+> and the exact build/run commands.
 
 ---
 
-## R6 Hardware Specifications (Verified)
+## Why this is hard (and what we found)
+
+QEMU's existing Canon support covers only DIGIC I–IV (ARM7/ARM9) cameras. The R6's
+DIGIC X is a dual Cortex-A9 (ARMv7-A, Thumb-2) SoC, so a new QEMU machine is required.
+
+The key reverse-engineering result (confirmed by disassembling the ROM, not guessed):
+
+- **The GIC is at `0xC1000000` with a non-standard register map.** The firmware's IRQ
+  dispatcher (`0xE022D470`) reads IAR at `0xC100010C`, writes EOIR at `0xC1000110`, and
+  the IPI trigger writes SGIR at `0xC1001F00`. Standard GICv2 puts IAR/EOIR at
+  `+0x008/+0x00C` — no stock base aligns DIGIC X's offsets, so a **custom GIC shim** is
+  the only way. This was the root cause of the boot panic: with no working GIC, no SGIs
+  fire, the dual-core scheduler deadlocks, and DryOS halts with a spinlock-timeout panic.
+- **Core 1 is released by GIC SGI 12** (not a simple mailbox write). The entry
+  (`0xE0100001`) reads MPIDR and routes core 1 to its secondary init.
+- **No ARMv8 generic timer** is used (zero CP15 `c14` instructions in the ROM); timekeeping
+  is SGIs + a Marius timer block.
+
+---
+
+## Hardware model (implemented)
 
 ```
-CPU:        ARM Cortex-A9 (ARMv7-A, Thumb-2)
-ROM Base:   0xE0000000 (128 MB address space)
-Bootable:   0xE0100000 (boot00.bin, 36.75 MB)
-RAM:        0x00002000 - 0x3FFFFFFF (1 GB cacheable)
-Uncacheable: 0x40000000 - 0xBEFFFFFF (2 GB)
-MMIO:       0xBF000000 - 0xDEFFFFFF (512 MB)
-LED GPIO:   0xD22390C0 (ON=0x24D0002, OFF=0x24C0003)
-Firmware:   1.7.0 (Build: Oct 3, 2022, K453)
-```
-
-### Boot Vector (Verified Identical 1.5.0 → 1.7.0)
-
-```
-0xE0100058: BR_DCACHE_CLN_1  (dcf226f2)
-0xE0100062: BR_ICACHE_INV_1  (dcf28bf2)
-0xE010008E: BR_DCACHE_CLN_2  (dcf20bf2)
-0xE0100098: BR_ICACHE_INV_2  (dcf270f2)
-0xE01000AE: BR_BR_CSTART     (0e4840f0) ← Branch to cstart
-0xE0100138: BR_BZERO32
-0xE010019A: BR_CREATE_ITASK
+CPU:        dual ARM Cortex-A9 (ARMv7-A, Thumb-2), core 1 released on SGI 12
+RAM:        1 GB @ 0x00000000  +  2 GB @ 0x40000000
+GIC:        custom shim @ 0xC1000000  (IAR +0x10C, EOIR +0x110, SGIR +0x1F00, ...)
+UART:       PL011 @ 0xBF002000  (best guess — re-verify; not the boot blocker)
+Marius:     timer @ 0xC0208000 (TODO), INTCs @ 0xD231A000 / 0xD233A000 (SPI 32/33)
+LED GPIO:   0xD22390C0  (ON=0x24D0002, OFF=0x24C0003 — Magic-Lantern verified)
+Power/SRAM: 0xDFFC0000  (core-1 mailbox 0xDFFC4FA0)
+Flash:      gang100.bin @ 0xE0000000 (64 MB), gang200.bin @ 0xE4000000 (32 MB)
+Entry:      0xE0100001 (boot00.bin, Thumb)
+Display:    MARV framebuffer reader (descriptor at 0x14B000) -> SDL window, ~30 Hz
 ```
 
 ---
 
-## Project Structure
+## Repository layout
 
 ```
 R6-Bionic/
-├── README.md              ← This file
-├── qemu/                  ← Cloned qemu-eos (reticulatedpines)
-│   ├── hw/arm/r6.c        ← NEW: R6 machine definition
-│   ├── hw/arm/Kconfig     ← MODIFIED: Added CANON_R6 option
-│   ├── hw/arm/meson.build ← MODIFIED: Added r6.c to build
-│   └── ...                ← Rest of QEMU source
+├── README.md               ← this file
+├── STATUS.md               ← concise current state + next steps
+├── patches/
+│   ├── r6.c                ← the QEMU machine (source of truth)
+│   └── qemu-r6.patch       ← build integration (Kconfig / default.mak / meson.build)
 ├── docs/
-│   └── R6_ANALYSIS.md     ← Full firmware analysis from previous work
-└── rom/                   ← ROM dumps (link or copy here)
-    ├── gang100.bin        ← 64 MB primary ROM
-    ├── gang200.bin        ← 32 MB secondary ROM
-    └── boot00.bin         ← 36.75 MB bootable firmware
+│   ├── QEMU_FINDINGS.md    ← LIVE verified findings + implementation status (read first)
+│   └── PERIPHERAL_MAP.md   ← peripheral register map (from ROM analysis)
+├── scripts/
+│   └── build.sh            ← clone QEMU, apply patch, build
+└── qemu/                   ← local QEMU checkout (gitignored; built in WSL)
 ```
+
+ROM dumps are **not** committed (too large; see `docs/QEMU_FINDINGS.md` §4 for locations).
 
 ---
 
-## Build Instructions
-
-### Prerequisites (WSL2 Ubuntu)
+## Build (WSL2 Ubuntu)
 
 ```bash
-sudo apt update
-sudo apt install -y \
-    g++ make ninja-build \
-    libglib2.0-dev libpixman-1-dev \
-    libslirp-dev libcap-ng-dev \
-    libnuma-dev libattr1-dev \
-    python3 python3-pyelftools \
-    git meson
-```
+# deps (once)
+sudo apt update && sudo apt install -y g++ ninja-build \
+    libglib2.0-dev libpixman-1-dev libslirp-dev libcap-ng-dev libnuma-dev \
+    libattr1-dev python3 python3-pyelftools git meson
 
-### Build QEMU with R6 Support
-
-```bash
-cd R6-Bionic/qemu
+# build (from scripts/build.sh, or manually)
+git clone <qemu-eos-fork> qemu        # QEMU 6.1 based
+cd qemu && git apply ../patches/qemu-r6.patch && cp ../patches/r6.c hw/arm/r6.c
 mkdir build && cd build
-../configure \
-    --target-list=arm-softmmu \
-    --enable-docs=no \
-    --disable-werror
+../configure --target-list=arm-softmmu --enable-docs=no --disable-werror
 ninja -j$(nproc)
 ```
 
-### Run the R6 Emulator
+## Run (with graphics)
 
 ```bash
-# Copy ROM dumps
-cp /path/to/rom/gang100.bin build/
-cp /path/to/rom/boot00.bin build/
-
-# Run QEMU with R6 machine
-./build/qemu-system-arm \
-    -machine canon-r6 \
-    -cpu cortex-a9 \
-    -m 1G \
-    -bios rom/gang100.bin \
-    -nographic \
-    -s -S
-```
-
-### Connect GDB
-
-```bash
-# In another terminal
-arm-none-eabi-gdb
-(gdb) target remote localhost:1234
-(gdb) break *0xE01000AE   # cstart branch
-(gdb) continue
+# put the ROMs in the current directory: boot00.bin gang100.bin gang200.bin
+./qemu/build/qemu-system-arm -M canon-r6 -smp 2 -m 3G \
+    -bios boot00.bin \
+    -monitor unix:/tmp/r6mon.sock,server,nowait
+# DO NOT pass -nographic — WSLg shows the SDL window.
+# Success line on stderr: [r6] display: MARV@0x... bitmap=0x... 2048x1080
 ```
 
 ---
 
-## What Works / What Doesn't
+## What works / what's next
 
-### ✅ Implemented
-- R6 machine definition (`canon-r6`)
-- ARM Cortex-A9 CPU
-- Memory map (RAM, uncacheable RAM, ROM, MMIO)
-- ROM loading (gang100.bin, boot00.bin)
-- Build system integration (Kconfig, meson)
-- LED GPIO address mapping
+- ✅ `canon-r6` machine, dual Cortex-A9, memory map, ROM loading
+- ✅ **Custom GIC shim** (DIGIC X layout) + core-1 release on SGI 12
+- ✅ Vector table at the firmware VBAR (`0xE0300980`), IRQ → firmware dispatcher
+- ✅ MARV framebuffer reader (GUI graphics once the firmware renders)
+- ✅ MMIO logging stub (learn register layouts from the firmware's own behaviour)
+- ⏳ Marius timer model (SPI 32/33) — if the OS tick needs it
+- ⏳ UART base re-verification (console output)
+- ⏳ Input injection (virtual keypad) — once the GUI is visible
+- ⏳ SD controller / EDMAC — for ML file I/O and MLV
 
-### ❌ Not Yet Implemented (Needed to Run DryOS)
-- **GIC (Generic Interrupt Controller)** - Required for all interrupts
-- **UART** - Actual R6 UART registers (location unknown)
-- **Timer** - Actual R6 timer (DIGIC timer is close but may differ)
-- **SD Card Controller** - Needed for file I/O
-- **EDMAC (DMA Controller)** - Needed for sensor data transfer
-- **Display Controller** - Needed for LCD output
-- **Sensor Interface** - Needed for image capture
-- **Cache Controller** - L1/L2 cache management
-- **Power Management** - Clock gating, voltage scaling
-- **Secure Boot Bypass** - RSA signature verification (if present)
+## Magic Lantern compatibility
 
-### ⚠️ Known Issues
-- `CONFIG_MEMORY_SRM_NOT_WORKING` - SRM allocation crashes camera (from ML R6.150)
-- `CONFIG_IMAGE_CAPTURE_NOT_WORKING` - Image capture causes null pointer crash
-- `CONFIG_NO_BFNT` - No bitmap font in ROM, must load from card
+The R6.150 ML platform is directly compatible with 1.7.0 (same CPU, memory map, boot
+addresses, GUI codes, CBasic functions). Once the camera GUI renders in QEMU, ML modules
+(hello_world, false_color, histogram, zebra, …) are the target workload.
 
 ---
 
-## Development Roadmap
-
-### Phase 1: Basic Boot (Current)
-- [x] R6 machine definition
-- [x] Memory map
-- [x] ROM loading
-- [ ] GIC implementation
-- [ ] UART (for debug output)
-- [ ] Verify boot vector executes in QEMU
-- [ ] Step through cstart with GDB
-
-### Phase 2: Minimal DryOS
-- [ ] Timer implementation
-- [ ] SD card controller (for file I/O)
-- [ ] NVRAM emulation
-- [ ] DryOS task scheduler
-- [ ] CBasic interpreter (or skip to ML payload)
-
-### Phase 3: Magic Lantern
-- [ ] Load ML autoexec.bin
-- [ ] GUI compositor (XIMR)
-- [ ] Button input (BGMT)
-- [ ] Menu system
-- [ ] Module loading
-
-### Phase 4: Full Functionality
-- [ ] Sensor readout (EDMAC)
-- [ ] MLV raw video
-- [ ] JPEG/H.264 encoding
-- [ ] Display output
-- [ ] AF/AE systems
-
----
-
-## Key Files for Reference
-
-| File | Location | Purpose |
-|------|----------|---------|
-| `hw/arm/r6.c` | `qemu/` | R6 machine definition |
-| `hw/arm/digic_boards.c` | `qemu/` | Existing DIGIC I-IV (reference) |
-| `include/hw/arm/digic.h` | `qemu/` | DIGIC SoC model (reference) |
-| `hw/char/digic-uart.c` | `qemu/` | DIGIC UART (reference) |
-| `hw/timer/digic-timer.c` | `qemu/` | DIGIC Timer (reference) |
-| `platform/R6.150/consts.h` | ML source | Verified R6 addresses |
-| `platform/R6.150/internals.h` | ML source | R6 config flags |
-| `platform/R6.150/gui.h` | ML source | Button codes |
-
----
-
-## Magic Lantern Compatibility
-
-The R6.150 ML platform is directly compatible with 1.7.0:
-- All boot addresses match
-- Same CPU (Cortex-A9)
-- Same memory map
-- Same GUI codes
-- Same CBasic functions
-
-**ML modules that should work in QEMU (once boot works):**
-- hello_world
-- dual_iso (if sensor emulation works)
-- false_color
-- histogram
-- zebra
-- MLV (once EDMAC is emulated)
-
----
-
-## Next Immediate Steps
-
-1. **Build QEMU** with the R6 machine (needs WSL2 + dependencies)
-2. **Fix compilation errors** in `r6.c` (likely some API mismatches)
-3. **Add GIC** - Without interrupts, DryOS will immediately fault
-4. **Add working UART** - Need to find the actual R6 UART base address
-5. **Test boot** - Even if it crashes, we should see the first few instructions execute
-6. **Debug with GDB** - Step through the boot vector to understand what it expects
-
----
-
-*Project created: 2026-10-11*
-*Based on: R6 firmware 1.7.0 ROM analysis, Magic Lantern R6.150 platform, qemu-eos fork*
+*Project: R6-Bionic · Canon EOS R6, DIGIC X, firmware 1.7.0 · QEMU 6.1 fork*

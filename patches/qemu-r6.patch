@@ -15,7 +15,6 @@
 
 +config CANON_R6
 +    bool
-+    select ARM_GIC
 +
  config EXYNOS4
      bool

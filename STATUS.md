@@ -1,134 +1,78 @@
-# R6-Bionic - QEMU Emulation Status
+# R6-Bionic — Current Status
 
-**Date:** 2026-10-11
-**Location:** `C:\Users\Mega\Downloads\R6-Bionic\`
+**Updated:** 2026-10-12
+**Location:** `C:\Users\Mega\Downloads\R6-Bionic\` (GitHub `klosixgaming-arch/r6-bionic`)
 
----
+## Where we are
 
-## What We Did
+The `canon-r6` QEMU machine is **implemented and compiling**. The firmware (1.7.0)
+boots past the boot ROM, power-init handshake, and runs real ROM code. It previously
+hit a **deliberate DryOS halt** — a spinlock-timeout panic (Module 64 / Panic 6) at
+`0xE01AE2DC`. That is a *symptom*, not a hang.
 
-### 1. Research
+**Root cause (confirmed by disassembling the ROM):** the firmware's GIC lives at
+`0xC1000000` with a **non-standard register layout** (IAR `+0x10C`, EOIR `+0x110`,
+SGIR `+0x1F00`, distributor at the *higher* address). QEMU's stock GIC cannot serve
+that map, so no IRQs routed and no SGIs fired → the dual-core scheduler's IPI
+synchronization deadlocked → spinlock timeout → panic.
 
-| Source | Finding |
-|--------|---------|
-| `reticulatedpines/qemu-eos` | QEMU fork with basic DIGIC I-IV support. Only `canon-a1100` (PowerShot, ARM9) machine exists. **No DIGIC X / R6 support.** |
-| `docs/system/arm/digic.rst` | "Emulation is incomplete. Cannot run original camera firmware, only barebox bootloader." |
-| `hw/arm/digic_boards.c` | Single board: `canon-a1100` (DIGIC IV, ARM946, 64MB RAM, 4MB flash) |
-| `coon42/openrp` | PCB reverse engineering of EOS RP (KiCad). **Not QEMU emulation.** LED at 0xD22392B8. |
-| ML forum topic 2864 | "How to run Magic Lantern into QEMU?!" - long thread, basic DIGIC I-IV only |
-| ML forum topic 23814 | "Canon emulator" - "ARM CPU emulation is the smallest problem since it is provided by Qemu. All the custom or very specific chips around it are the difficult ones." |
+## What was fixed (this session)
 
-**Bottom line:** No one has a working R6/RP in QEMU. The existing DIGIC support covers ARM7/ARM9 cameras only. The R6's Cortex-A9 (ARMv7-A) is a different architecture that needs new QEMU machine code.
+1. **Custom GIC shim** at the DIGIC X address/offset map (IAR/EOIR/SGIR/ISENABLER/
+   ICENABLER/ITARGETSR/ICFGR/CTR/PMR). Replaces the stock `arm_gic`.
+2. **Core-1 release on GIC SGI 12** (the firmware's verified release kick; boot trace's
+   last write is `0xC1001F00 <= 0x0002000C`). Core 1 starts powered-off and is started
+   at the entry `0xE0100001` (which routes core 1 to its secondary init via MPIDR).
+3. **Vector table** installed at the firmware VBAR `0xE0300980` (and the older
+   `0x49234822`), IRQ → the firmware's own dispatcher `0xE022D470`.
+4. **Removed** the wrong stock GIC + A9 PL320/PL031 timers (firmware uses neither).
+5. **MMIO disambiguation:** the 512 MB logging stub is mapped first; GIC/UART/power/LED
+   mapped after so they win (QEMU 6.1 rule: equal priority → newest-added wins).
+6. Kept the working pieces: LED GPIO, power/mailbox block, battery seed, and the **MARV
+   framebuffer reader** that renders the GUI once the firmware gets past the scheduler.
 
-### 2. Implementation
+## Build status
 
-Created `hw/arm/r6.c` - a new QEMU machine definition for the Canon EOS R6:
+- `patches/r6.c` — rewritten, **compiles clean** in the QEMU 6.1.93 fork (`ninja` OK).
+- Next: run **with graphics** (no `-nographic`) and read the new boot trace.
 
-```c
-// Key features:
-- ARM Cortex-A9 CPU
-- 1 GB cacheable RAM (0x00002000)
-- 2 GB uncacheable RAM (0x40000000)
-- 512 MB MMIO region (0xBF000000)
-- 128 MB ROM region (0xE0000000)
-- ROM loading (gang100.bin + boot00.bin)
-- Boot vector at 0xE0100000
-- LED GPIO at 0xD22390C0
-```
+## Immediate next steps
 
-Modified:
-- `hw/arm/Kconfig` - Added `CONFIG_CANON_R6` option
-- `hw/arm/meson.build` - Added `r6.c` to build
+1. Run QEMU (graphics) and capture the new `boot.log`.
+2. If a new panic appears, decode its Module/Panic code + the spinning PC and map it to
+   the next missing peripheral (likely the **Marius timer** tick, SPI 32/33).
+3. Implement the Marius timer model if the OS tick needs it.
+4. Re-verify the **UART** base/flag offsets from the firmware TX poll loop (console output).
+5. Once the GUI renders: add **input injection** (virtual keypad) and start ML modules.
 
-### 3. Build Environment
+## Hardware gap (what DryOS still needs)
 
-- WSL2 Ubuntu: ✅ Working
-- Dependencies installed: ✅ (ninja, glib, pixman, python3, etc.)
-- CRLF fixed: ✅
-- Full build: ⏳ Too slow on Windows filesystem (needs native WSL storage)
+| Component | Status | Needed for |
+|-----------|--------|-----------|
+| CPU (dual Cortex-A9) | ✅ | everything |
+| Memory map + ROM loading | ✅ | boot |
+| **GIC (custom shim)** | ✅ implemented | scheduler IPIs, ticks |
+| Core-1 bring-up (SGI 12) | ✅ implemented | dual-core scheduler |
+| **Marius timer** | ⏳ TODO | OS tick / HPTimer |
+| UART | ⚠️ best-guess base | console debug |
+| SD controller | ❌ | ML file I/O |
+| EDMAC (DMA) | ❌ | sensor / MLV |
+| Display (MARV reader) | ✅ wired | GUI graphics |
+| Button input | ⏳ after GUI | ML menus |
 
----
-
-## What's Needed to Actually Run the Firmware
-
-The R6's DryOS expects a LOT of hardware. Here's the gap:
-
-| Component | Status | Effort |
-|-----------|--------|--------|
-| CPU (Cortex-A9) | ✅ QEMU has it | Done |
-| Memory map | ✅ Defined in r6.c | Done |
-| ROM loading | ✅ Implemented | Done |
-| **GIC (Interrupts)** | ❌ Missing | **HIGH** - Without this, DryOS faults immediately |
-| **UART** | ❌ Missing | **MEDIUM** - Need actual R6 UART registers |
-| **Timer** | ⚠️ DIGIC timer exists but may differ | MEDIUM |
-| **SD Card Controller** | ❌ Missing | HIGH - Needed for file I/O |
-| **EDMAC (DMA)** | ❌ Missing | HIGH - Needed for sensor data |
-| **Display Controller** | ❌ Missing | HIGH - Needed for LCD |
-| **Cache Controller** | ⚠️ QEMU has L1/L2 | LOW |
-| **Secure Boot** | ⚠️ Unknown | MEDIUM - RSA verification may block |
-
-### Minimum to See the Boot Vector Execute
-
-1. **GIC** - Without interrupt controller, the first exception (even a timer tick) will fault
-2. **UART** - So we can see debug output
-3. **Timer** - DryOS uses timers for scheduling
-
-### Minimum to Run Magic Lantern
-
-4. **SD Card** - ML loads from SD card
-5. **Display** - ML GUI renders to LCD framebuffer
-6. **Button input** - BGMT event system
-
----
-
-## Recommended Next Steps
-
-### Priority 1: Get the Boot Vector Running
-1. Implement a basic GICv2 (or use QEMU's existing `arm_gic` with correct settings)
-2. Find the R6 UART base address (search ROM for UART register patterns)
-3. Wire up the timer
-4. Run QEMU + GDB, step through the first 20 instructions
-5. Identify what the firmware expects at each step
-
-### Priority 2: Basic I/O
-6. Implement SD card controller (can reuse QEMU's `sdhci` with R6-specific registers)
-7. Implement framebuffer display (we know the VRAM address from ML: `FEATURE_VRAM_RGBA`)
-8. Implement button input (BGMT codes from `gui.h`)
-
-### Priority 3: Full Emulation
-9. EDMAC DMA controller (236 references in firmware)
-10. Sensor interface
-11. ISP/JPEG pipeline (or stub)
-
----
-
-## How to Build (When Ready)
+## Build & run (quick reference)
 
 ```bash
-# Copy source to WSL native filesystem for speed
-cp -r /mnt/c/Users/Mega/Downloads/R6-Bionic ~/R6-Bionic
-cd ~/R6-Bionic/qemu
-mkdir build && cd build
-../configure --target-list=arm-softmmu --disable-werror
-ninja -j$(nproc)
+# build (WSL)
+cp patches/r6.c ~/r6b-qemu/hw/arm/r6.c
+cd ~/r6b-qemu/build && ninja -j32 qemu-system-arm
 
-# Run
-cp /path/to/gang100.bin .
-cp /path/to/boot00.bin .
-./qemu-system-arm -machine canon-r6 -cpu cortex-a9 -m 1G -nographic -s -S
+# run WITH graphics (ROMs in cwd)
+cd ~/r6b-run
+~/r6b-qemu/build/qemu-system-arm -M canon-r6 -smp 2 -m 3G \
+    -bios boot00.bin -monitor unix:/tmp/r6mon.sock,server,nowait
+# success: [r6] display: MARV@0x... bitmap=0x... 2048x1080
 ```
 
----
-
-## File Manifest
-
-```
-R6-Bionic/
-├── README.md                    ← Full project documentation
-├── STATUS.md                    ← This file
-└── qemu/                        ← qemu-eos fork with R6 additions
-    ├── hw/arm/r6.c             ← NEW: R6 machine (283 lines)
-    ├── hw/arm/Kconfig          ← MODIFIED: +CANON_R6
-    ├── hw/arm/meson.build      ← MODIFIED: +r6.c
-    └── ...                     ← QEMU source
-```
+> Full details, every verified address, and the agent-disagreement resolutions are in
+> [`docs/QEMU_FINDINGS.md`](docs/QEMU_FINDINGS.md).

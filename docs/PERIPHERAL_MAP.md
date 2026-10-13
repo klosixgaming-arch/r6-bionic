@@ -1,141 +1,110 @@
-# R6-Bionic - Peripheral Register Map
+# R6-Bionic — Peripheral Register Map (DIGIC X, firmware 1.7.0)
 
-**Source:** ROM analysis of firmware 1.7.0 (boot00.bin)
-**Date:** 2026-10-11
+**Source:** ROM disassembly of `boot00.bin` / `gang100.bin` (base `0xE0100000`),
+cross-checked with the hardware agent. **The ROM is the tie-breaker** where reports
+disagreed. See [`QEMU_FINDINGS.md`](QEMU_FINDINGS.md) for the full record.
+**Updated:** 2026-10-12
 
----
-
-## Confirmed Peripherals
-
-| Peripheral | Base Address | References | Notes |
-|-----------|-------------|------------|-------|
-| **UART** | 0xBF002000 | 1,391 | Primary debug console. "StopRedirectUART" function exists |
-| **GIC (INTC)** | 0xBF000000 | 402 | Interrupt controller. Distributor at +0x100 |
-| **GIC Distributor** | 0xBF000100 | 8 | ISENABLER at +0x100 (GICv2 pattern) |
-| **GIC CPU IF (2)** | 0xC0000100 | 5+ | Second interrupt controller (multi-core) |
-| **GIC CPU IF (3)** | 0xD0000100 | 5+ | Third interrupt controller |
-| **GIC CPU IF (4)** | 0xD2000100 | 5+ | Fourth interrupt controller |
-| **LED GPIO** | 0xD22390C0 | Verified | ON=0x24D0002, OFF=0x24C0003 |
-| **MMIO Block 2** | 0xBF006000 | 19 | Unknown (timer? clock?) |
-| **MMIO Block 3** | 0xBF00B000 | 52 | Unknown (SD controller?) |
-| **MMIO Block 4** | 0xBF00E000 | 26 | Unknown |
+> ⚠️ Earlier drafts listed the GIC at `0xBF000000` and the UART at `0xBF002000`.
+> Disassembly shows the **GIC is at `0xC1000000`** with a non-standard layout, and the
+> UART base is still unconfirmed. Corrected below.
 
 ---
 
-## GIC Analysis
+## Confirmed peripherals
 
-The R6 appears to have **multiple GIC instances** (or one GIC with multiple CPU interfaces):
-
-```
-0xBF000000 : GIC Distributor base (402 refs)
-0xBF000100 : GIC Distributor + 0x100 (ISENABLER - standard GICv2)
-0xC0000000 : GIC instance 2 base
-0xC0000100 : GIC instance 2 + 0x100
-0xD0000000 : GIC instance 3 base
-0xD0000100 : GIC instance 3 + 0x100
-0xD2000000 : GIC instance 4 base
-0xD2000100 : GIC instance 4 + 0x100
-```
-
-This suggests either:
-- A 4-core Cortex-A9 with per-core GIC CPU interfaces (most likely)
-- Or multiple independent interrupt domains
-
-**For QEMU:** Implement as a single GICv2 with 4 CPU interfaces, or start with 1 core and 1 GIC.
+| Peripheral | Base Address | Evidence | Notes |
+|-----------|-------------|----------|-------|
+| **GIC (DIGIC X)** | **`0xC1000000`** | IRQ dispatcher `0xE022D470`; SGIR `0xE0163C34` | **Non-standard layout — custom shim required** |
+| **Core-1 mailbox** | `0xDFFC4FA0` | boot ROM `gang100 @ 0xE0004900/0xE000B2DC` | value = `0xE0100001`; released on **SGI 12** |
+| **LED GPIO** | `0xD22390C0` | Magic Lantern R6.150 (hardware-verified) | ON=`0x24D0002`, OFF=`0x24C0003` |
+| **Marius timer** | `0xC0208000` | hardware agent | ch0 @ `0xC0208890`, 16 B/channel |
+| **Marius INTC** | `0xD231A000` | hardware agent | read-id `+0x00`, ACK `+0x10`, SPI 32 |
+| **Omar INTC** | `0xD233A000` | hardware agent | read-id `+0x00`, ACK `+0x10`, SPI 33 |
+| **UART0** | `0xBF002000` (best guess) | 29 ROM literal refs (struct-table, unconfirmed) | **re-verify** — also a clean thunk to `0xC0800000` |
+| **VBAR (vector table)** | `0xE0300980` | entry `0xE0100000` | set for both cores; IRQ dispatcher `0xE022D470` |
+| **MARV layer 0 (GUI)** | `0x14B000` | hardware agent (live 1.7.0 dump) | sig `0x5652414D`; +0x04 bitmap, +0x1C w, +0x20 h |
+| **Battery/Temp** | `0x11D28C`/`0x11D290` | hardware agent | mV / °C |
 
 ---
 
-## UART Analysis
+## GIC (DIGIC X) — the critical finding
 
-- Base: **0xBF002000** (1,391 references - very heavily used)
-- 54 unique register addresses in the 0xBF002000-0xBF002FFF block
-- "StopRedirectUART" function at 0xE04C2BA8 (context: gyro data, Hall sensors)
-- "console" string found (output, file, both, lv_dispafframe)
+**Absolute register map (implemented by the custom shim):**
 
-**Likely register layout** (standard UART pattern):
-```
-0xBF002000 : DR  (Data Register)
-0xBF002004 : RSRECR (Receive Status)
-0xBF002008 : RTSRDR (Transmit Status)  
-0xBF00200C : CR  (Control Register)
-0xBF002010 : IBRD (Integer Baud Rate)
-0xBF002014 : FBRD (Fractional Baud Rate)
-0xBF002018 : LCRH (Line Control)
-0xBF00201C : OF (Offset)
-0xBF002020 : ECC (Error Clear)
-0xBF002024 : IMS (Interrupt Mask Set)
-0xBF002028 : MIS (Masked Interrupt Status)
-0xBF00202C : RIC (Raw Interrupt Clear)
-0xBF002030 : PMCR (Power Management Control)
-```
-(This is a guess based on PL011/DesignStart UART layout - needs verification)
+| Address | Register | Notes |
+|---------|----------|-------|
+| `0xC1000100` | GICC_CTLR | boot writes `0x1` |
+| `0xC1000104` | GICC_PMR | boot writes `0xFF` (allow all) |
+| `0xC100010C` | **GICC_IAR** | read → INTID, or `1023` if none |
+| `0xC1000110` | **GICC_EOIR** | write → INTID |
+| `0xC1001000` | GICD_CTLR | boot writes `0x1` |
+| `0xC1001080+n*4` | GICD_ISENABLER[n] | set enable bits (word n = IRQs 32n..32n+31) |
+| `0xC1001180+n*4` | GICD_ICENABLER[n] | write-1-clears |
+| `0xC1001800+n*4` | GICD_ITARGETSR[n] | per-IRQ CPU target mask |
+| `0xC1001C00+n*8` | GICD_ICFGR[n] | edge-triggered |
+| `0xC1001F00` | **GICD_SGIR** | `[31:16]=TargetList`, `[9:0]=INTID` |
 
----
+**Why not the stock QEMU GIC:** standard GICv2 has IAR@`+0x008`/EOIR@`+0x00C` from the
+CPU-interface base; DIGIC X puts them at `+0x10C`/`+0x110` and puts the distributor at
+the *higher* address. No stock base aligns all four registers.
 
-## MMIO Block Map
+**SGI roles:** SGI 10 = scheduling (context switch), SGI 11 = timer tick, SGI 12 =
+**core-1 release kick**. SPI 32/33 = Marius/Omar INTCs.
 
-```
-0xBF000000 : 18 registers  ← GIC Distributor
-0xBF001000 : ?
-0xBF002000 : 54 registers  ← UART
-0xBF003000 : 1 register
-0xBF004000 : 2 registers
-0xBF006000 : 19 registers  ← ? (timer/clock)
-0xBF007000 : 1 register
-0xBF008000 : 13 registers  ← ?
-0xBF009000 : 10 registers  ← ?
-0xBF00B000 : 52 registers  ← ? (SD controller?)
-0xBF00C000 : 3 registers
-0xBF00D000 : 4 registers
-0xBF00E000 : 26 registers  ← ?
-0xBF00F000 : 16 registers
-```
+**Interrupt vector table:** the firmware's registered vector table has **640 entries**
+(IRQ 0..639): EDMAC[0-63], POSTMAN[104-119], MARIUS_TIMER[120-151], DOLPHIN[170-185],
+SDIO[260-275], MIPI DSI[340-355], TSENS[585], XIMR[614].
 
 ---
 
-## Boot Vector (Verified)
+## Core-1 bring-up
 
 ```
-0xE0100000 : Entry point (first instruction)
-0xE0100028 : 0xE0300980 (initial SP or PC target)
-0xE0100058 : BR_DCACHE_CLN_1  (dcf226f2)
-0xE0100062 : BR_ICACHE_INV_1  (dcf28bf2)
-0xE010008E : BR_DCACHE_CLN_2  (dcf20bf2)
-0xE0100098 : BR_ICACHE_INV_2  (dcf270f2)
-0xE01000AE : BR_BR_CSTART     (0e4840f0) ← Jump to cstart
-0xE0100138 : BR_BZERO32
-0xE010019A : BR_CREATE_ITASK
+core 0 (boot00 entry 0xE0100001):
+    VBAR = 0xE0300980 ; SP = 0x2000
+    read MPIDR
+    core 0 -> cold-boot copy + cstart (0xE01000EC path)
+    core 1 -> 0xE01000EC secondary init (calls 0xE01003B8)
+
+release:
+    core 0 fires GIC SGI 12 to CPU 1  (SGIR 0xC1001F00 <= 0x0002000C)
+    core 1 wakeup: ldr r0, [0xDFFC4FA0] ; bx r0   ; -> 0xE0100001
 ```
 
-The boot sequence:
-1. D-cache clean (flush)
-2. I-cache invalidate
-3. Branch to cstart (Canon's init function)
-4. cstart calls BZERO32 (memory zero)
-5. cstart calls CREATE_ITASK (create first task)
+QEMU: core 1 starts powered-off; the GIC shim starts it on SGI 12 (or a mailbox write).
 
 ---
 
-## Key Functions for QEMU Stubbing
+## Boot entry (boot00, Thumb)
 
-To get the firmware to run (even briefly), QEMU needs to respond to:
-
-1. **Cache operations** (0xE0100058-0xE0100098) - These are ARM instructions (MCR/MRC), QEMU handles these natively
-2. **cstart function** - Need to find where it jumps to and what it expects
-3. **Memory zeroing** (BZERO32) - QEMU RAM handles this
-4. **Task creation** (CREATE_ITASK) - Needs OS-level emulation
-5. **UART output** (0xBF002000) - For debug messages
-6. **Timer interrupts** (GIC + timer) - For scheduling
+```
+0xE0100000 : ldr r0, [pc, #0x24]      ; VBAR value
+0xE0100002 : mcr p15, #0, r0, c12, c0, #0   ; VBAR = 0xE0300980
+0xE010000A : movw r0, #0x2000 ; movt r0, #0 ; mov sp, r0   ; SP = 0x2000
+0xE0100014 : mrc p15, #0, r5, c0, c0, #5   ; MPIDR
+0xE0100018 : ands r0, r5, #0xf
+0xE010001C : bne 0xE0100022            ; core != 0 -> secondary path
+0xE010001E : b.w 0xE010002C            ; core 0 -> cold-boot copy + cstart
+0xE0100022 : b.w 0xE01000EC            ; core 1 -> secondary init
+```
 
 ---
 
-## Next Steps for QEMU Implementation
+## Print / panic internals (for debugging QEMU hangs)
 
-1. **Stub UART** at 0xBF002000 - Respond to writes (print to host stdout)
-2. **Stub GIC** at 0xBF000000 - Accept writes, don't raise interrupts (initially)
-3. **Stub timer** at 0xBF006000 - Accept writes
-4. **Run boot vector** - See how far it gets before faulting
-5. **Debug with GDB** - Identify each missing peripheral
-6. **Iterate** - Add each peripheral as needed
+- `0xE04BF000` = `print_msg(fmt, ...)` (AAPCS r0=fmt, r1..r3=args), spinlock `0x4144`.
+- Spinlock primitive `0xE0354F64` (`ldrex/strex`), timeout counter from `0xE0CBD51C`.
+- Panic print `0xE01AE2CC`: `"DRYOS PANIC: Module Code=%d, Panic Code=%d[puId %d]"`;
+  Module 64 = kernel, Panic 6 = lock timeout; infinite `b .` at `0xE01AE2DC`.
+- `0xE07C8F74` = `kernel_unlock()` (`*0x4024 = 0`); `0xE07C8B08` = yield;
+  `0xE07C8E18` = send reschedule IPI (SGI 10).
 
-The strategy is "bottom-up stubbing": start with minimal hardware, run the boot code, see what it accesses, add that peripheral, repeat.
+---
+
+## Still to confirm
+
+- **UART base + flag offsets** — the TX poll loop will tell us (`0xBF002000` vs
+  `0xC0800000` vs other). Not the boot blocker.
+- **gang200 real base** — `0xE4000000` (current) vs `0xF0000000` (one report).
+- **Marius INTC** read-id/ack protocol (only needed when modelling EDMAC/Omar).
